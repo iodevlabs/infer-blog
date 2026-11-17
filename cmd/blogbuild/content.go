@@ -11,10 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuin/goldmark"
-	"github.com/yuin/goldmark/extension"
-	"github.com/yuin/goldmark/parser"
-	"gopkg.in/yaml.v3"	
+	"gopkg.in/yaml.v3"
+	"inferorigins.com/infer-utils/markdown"
 )
 
 var (
@@ -34,39 +32,28 @@ var (
 )
 
 var canonicalTags = map[string]string{
-    "go":       "Go",
-    "linux":    "Linux",
-    "htmx":     "HTMX",
-    "nvidia":   "NVIDIA",
-    "llmops":   "LLMOps",
-    "mlflow":   "MLflow",
-    "opnsense": "OPNsense",
-    "spiffe":   "SPIFFE",
-    "spire":    "SPIRE",
-    "vllm":     "vLLM",
-    "k8s":      "k8s",
+	"go":       "Go",
+	"linux":    "Linux",
+	"htmx":     "HTMX",
+	"nvidia":   "NVIDIA",
+	"llmops":   "LLMOps",
+	"mlflow":   "MLflow",
+	"opnsense": "OPNsense",
+	"spiffe":   "SPIFFE",
+	"spire":    "SPIRE",
+	"vllm":     "vLLM",
+	"k8s":      "k8s",
 }
 
-var markdown = goldmark.New(
-	goldmark.WithExtensions(
-		extension.GFM,
-		extension.Footnote,
-		extension.Typographer,
-	),
-	goldmark.WithParserOptions(
-		parser.WithAutoHeadingID(),
-	),
-)
-
 type BlogMeta struct {
-	Title string `json:"title" yaml:"title"`
-	Slug string `json:"slug" yaml:"slug"`
-	Date string `json:"date" yaml:"date"`
-	Author string `json:"author" yaml:"author"`
-	Summary string `json:"summary" yaml:"summary"`
-	Description string `json:"description,omitempty" yaml:"description,omitempty"`
-	Tags []string `json:"tags" yaml:"tags"`
-	Featured bool `json:"featured" yaml:"featured"`
+	Title       string   `json:"title" yaml:"title"`
+	Slug        string   `json:"slug" yaml:"slug"`
+	Date        string   `json:"date" yaml:"date"`
+	Author      string   `json:"author" yaml:"author"`
+	Summary     string   `json:"summary" yaml:"summary"`
+	Description string   `json:"description,omitempty" yaml:"description,omitempty"`
+	Tags        []string `json:"tags" yaml:"tags"`
+	Featured    bool     `json:"featured" yaml:"featured"`
 
 	Image string `json:"image,omitempty" yaml:"image,omitempty"`
 	Cover string `json:"cover,omitempty" yaml:"cover,omitempty"`
@@ -81,44 +68,44 @@ type BlogMeta struct {
 }
 
 func normalizeTags(tags []string) []string {
-    seen := make(map[string]struct{})
-    result := make([]string, 0, len(tags))
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(tags))
 
-    for _, raw := range tags {
-        key := normalizeTag(raw)
+	for _, raw := range tags {
+		key := normalizeTag(raw)
 
-        if key == "" {
-            continue
-        }
+		if key == "" {
+			continue
+		}
 
-        if _, exists := seen[key]; exists {
-            continue
-        }
+		if _, exists := seen[key]; exists {
+			continue
+		}
 
-        seen[key] = struct{}{}
+		seen[key] = struct{}{}
 
-        if label, ok := canonicalTags[key]; ok {
-            result = append(
-                result,
-                label,
-            )
-        } else {
-            result = append(
-                result,
-                key,
-            )
-        }
-    }
+		if label, ok := canonicalTags[key]; ok {
+			result = append(
+				result,
+				label,
+			)
+		} else {
+			result = append(
+				result,
+				key,
+			)
+		}
+	}
 
-    sort.Slice(
-        result,
-        func(i, j int) bool {
-            return strings.ToLower(result[i]) <
-                strings.ToLower(result[j])
-        },
-    )
+	sort.Slice(
+		result,
+		func(i, j int) bool {
+			return strings.ToLower(result[i]) <
+				strings.ToLower(result[j])
+		},
+	)
 
-    return result
+	return result
 }
 
 func buildBlog() error {
@@ -259,13 +246,13 @@ func buildBlog() error {
 }
 
 func normalizeTag(value string) string {
-    value = strings.TrimSpace(value)
-    value = strings.Join(
-        strings.Fields(value),
-        " ",
-    )
+	value = strings.TrimSpace(value)
+	value = strings.Join(
+		strings.Fields(value),
+		" ",
+	)
 
-    return strings.ToLower(value)
+	return strings.ToLower(value)
 }
 
 func readArticle(
@@ -321,9 +308,7 @@ func readArticle(
 		remaining[:end]
 
 	body :=
-		remaining[
-			end+len("\n---\n"):
-		]
+		remaining[end+len("\n---\n"):]
 
 	if err := yaml.Unmarshal(
 		frontMatter,
@@ -396,7 +381,6 @@ func validateMeta(
 
 	return nil
 }
-
 
 func articleAssetURL(
 	slug string,

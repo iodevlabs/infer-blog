@@ -1,0 +1,397 @@
+// docsbuild assembles reviewed, repository-owned Markdown into public product docs.
+// It intentionally has no dependency on the private Infer Origins portal.
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"html"
+	"html/template"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"inferorigins.com/infer-utils/markdown"
+)
+
+type page struct {
+	Slug   string `json:"slug"`
+	Title  string `json:"title"`
+	Source string `json:"source"`
+}
+type group struct {
+	Title string `json:"title"`
+	Pages []page `json:"pages"`
+}
+type product struct {
+	Title       string  `json:"title"`
+	Description string  `json:"description"`
+	Navigation  []group `json:"navigation"`
+}
+type manifest struct {
+	Products map[string]product `json:"products"`
+}
+type site struct {
+	CompanyURL   string `json:"company_url"`
+	PublicOrigin string `json:"public_origin"`
+	Products     map[string]struct {
+		Origin string `json:"origin"`
+	} `json:"products"`
+}
+type indexRow struct {
+	Product string `json:"product"`
+	Section string `json:"section"`
+	Title   string `json:"title"`
+	Path    string `json:"path"`
+	Text    string `json:"text"`
+}
+type ragRow struct {
+	Product    string `json:"product"`
+	Section    string `json:"section"`
+	Title      string `json:"title"`
+	Canonical  string `json:"canonical_url"`
+	Repository string `json:"source_repository"`
+	Source     string `json:"source_path"`
+	Revision   string `json:"source_revision"`
+	Visibility string `json:"visibility"`
+	SHA        string `json:"sha256"`
+}
+
+var slugPattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+var docPattern = regexp.MustCompile(`doc:([a-z0-9-]+)/([a-z0-9-]+)`)
+var headingPattern = regexp.MustCompile(`(?m)^#\s+(.+)$`)
+
+func main() {
+	rootFlag := flag.String("root", ".", "CDeck checkout directory")
+	dirFlag := flag.String("docs", "../inferorigins/infer-docs", "docs source directory relative to CDeck root")
+	flag.Parse()
+	if err := build(*rootFlag, *dirFlag); err != nil {
+		fmt.Fprintln(os.Stderr, "docsbuild:", err)
+		os.Exit(1)
+	}
+}
+func readJSON(path string, v any) error {
+	b, e := os.ReadFile(path)
+	if e != nil {
+		return e
+	}
+	return json.Unmarshal(b, v)
+}
+func write(path string, data []byte) error {
+	if e := os.MkdirAll(filepath.Dir(path), 0755); e != nil {
+		return e
+	}
+	return os.WriteFile(path, data, 0644)
+}
+func jsonWrite(path string, v any) error {
+	b, e := json.MarshalIndent(v, "", "  ")
+	if e != nil {
+		return e
+	}
+	return write(path, append(b, '\n'))
+}
+func esc(v string) string { return html.EscapeString(v) }
+func gitRev(root, repo string) string {
+	if repo == "infer-docs" {
+		if v := os.Getenv("PUBLIC_DOCS_REV"); v != "" {
+			return v
+		}
+		return "working-tree"
+	}
+	b, e := exec.Command("git", "-C", filepath.Join(root, repo), "rev-parse", "HEAD").Output()
+	if e != nil {
+		return "working-tree"
+	}
+	return strings.TrimSpace(string(b))
+}
+func validOrigin(s string) bool {
+	u, e := url.Parse(s)
+	return e == nil && u.Scheme == "https" && u.Host != "" && (u.Path == "" || u.Path == "/") && u.RawQuery == "" && u.Fragment == ""
+}
+func sourcePath(root, source string) string {
+	if strings.HasPrefix(source, "infer-docs/content/") {
+		return filepath.Join(root, "..", "inferorigins", source)
+	}
+	return filepath.Join(root, source)
+}
+
+func validate(root string, m manifest, s site) error {
+	if !validOrigin(s.CompanyURL) {
+		return errors.New("site.json company_url must be an HTTPS origin")
+	}
+	if _, ok := m.Products["kforge"]; ok {
+		return errors.New("KForge is an engine, not a public product")
+	}
+	keys := map[string]bool{}
+	for id, p := range m.Products {
+		if !slugPattern.MatchString(id) {
+			return fmt.Errorf("invalid product: %s", id)
+		}
+		origin, ok := s.Products[id]
+		if !ok || !validOrigin(origin.Origin) {
+			return fmt.Errorf("missing or invalid origin for %s", id)
+		}
+		for _, g := range p.Navigation {
+			for _, pg := range g.Pages {
+				if !slugPattern.MatchString(pg.Slug) {
+					return fmt.Errorf("invalid slug: %s", pg.Slug)
+				}
+				key := id + "/" + pg.Slug
+				if keys[key] {
+					return fmt.Errorf("duplicate page %s", key)
+				}
+				keys[key] = true
+				if !(strings.HasPrefix(pg.Source, "infer-docs/content/") || strings.HasPrefix(pg.Source, "kforge/docs/public/") || strings.HasPrefix(pg.Source, "kforge-platform/docs/public/") || strings.HasPrefix(pg.Source, "infer-services/docs/public/")) {
+					return fmt.Errorf("non-public source: %s", pg.Source)
+				}
+				if filepath.IsAbs(pg.Source) || strings.Contains(pg.Source, "..") || strings.Contains(pg.Source, "\\") {
+					return fmt.Errorf("unsafe source: %s", pg.Source)
+				}
+				if _, e := os.Stat(sourcePath(root, pg.Source)); e != nil {
+					return fmt.Errorf("missing %s: %w", pg.Source, e)
+				}
+			}
+		}
+	}
+	for id, p := range m.Products {
+		for _, g := range p.Navigation {
+			for _, pg := range g.Pages {
+				b, e := os.ReadFile(sourcePath(root, pg.Source))
+				if e != nil {
+					return e
+				}
+				for _, match := range docPattern.FindAllStringSubmatch(string(b), -1) {
+					if !keys[match[1]+"/"+match[2]] {
+						return fmt.Errorf("broken doc link in %s: %s", id+"/"+pg.Slug, match[0])
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+func nav(productID string, p product, current string, depth int) string {
+	var b strings.Builder
+	for _, group := range p.Navigation {
+		b.WriteString(`<section class="nav-group"><h2>` + esc(group.Title) + `</h2>`)
+		for _, pg := range group.Pages {
+			target := pg.Slug + "/"
+			if depth == 2 {
+				target = "../" + pg.Slug + "/"
+			}
+			active := ""
+			if pg.Slug == current {
+				active = ` aria-current="page"`
+			}
+			b.WriteString(`<a href="` + esc(target) + `"` + active + `>` + esc(pg.Title) + `</a>`)
+		}
+		b.WriteString(`</section>`)
+	}
+	return b.String()
+}
+
+type portalSite struct {
+	CompanyName string `json:"company_name"`
+	DocsURL     string `json:"docs_url"`
+	Description string `json:"description"`
+	Socials     []struct {
+		Label string `json:"label"`
+		URL   string `json:"url"`
+	} `json:"socials"`
+}
+type shellData struct{ Site portalSite }
+
+// portalShell executes the exact shared header and footer templates from portald.
+// The public documentation output contains only rendered HTML and static assets.
+func portalShell(portalRoot, companyURL, docsURL string) (string, string, error) {
+	var data portalSite
+	if err := readJSON(filepath.Join(portalRoot, "content/data/site.json"), &data); err != nil {
+		return "", "", fmt.Errorf("portal site configuration: %w", err)
+	}
+	data.DocsURL = strings.TrimSuffix(docsURL, "/")
+	render := func(filename, name string) (string, error) {
+		contents, err := os.ReadFile(filepath.Join(portalRoot, "web/templates/partials", filename))
+		if err != nil {
+			return "", err
+		}
+		t, err := template.New(filename).Funcs(template.FuncMap{"year": func() int { return time.Now().Year() }}).Parse(string(contents))
+		if err != nil {
+			return "", err
+		}
+		var b bytes.Buffer
+		if err = t.ExecuteTemplate(&b, name, shellData{Site: data}); err != nil {
+			return "", err
+		}
+		// Shared templates use absolute-path site links. Resolve them to the
+		// configured main portal origin, not to the docs host.
+		s := b.String()
+		origin := strings.TrimSuffix(companyURL, "/")
+		s = strings.ReplaceAll(s, `href="/`, `href="`+origin+`/`)
+		s = strings.ReplaceAll(s, `src="/`, `src="`+origin+`/`)
+		return s, nil
+	}
+	h, err := render("header.html", "header")
+	if err != nil {
+		return "", "", err
+	}
+	f, err := render("footer.html", "footer")
+	if err != nil {
+		return "", "", err
+	}
+	return h, f, nil
+}
+func productTabs(m manifest, prefix string) string {
+	var b strings.Builder
+	b.WriteString(`<nav class="docs-products" aria-label="Documentation products">`)
+	for _, id := range []string{"cdeck", "opendp"} {
+		if p, ok := m.Products[id]; ok {
+			b.WriteString(`<a href="` + prefix + id + `/">` + esc(p.Title) + `</a>`)
+		}
+	}
+	b.WriteString(`</nav>`)
+	return b.String()
+}
+func pageHTML(title, id string, m manifest, content, canonical, current string, depth int, source string, header, footer string) string {
+	prefix := strings.Repeat("../", depth)
+	p := m.Products[id]
+	provenance := ""
+	if source != "" {
+		provenance = `<div class="source">Documentation source: <code>` + esc(source) + `</code></div>`
+	}
+	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="` + esc(p.Description) + `"><title>` + esc(title) + ` · ` + esc(p.Title) + ` · Infer Origins</title><link rel="canonical" href="` + esc(canonical) + `"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github.min.css"><link rel="stylesheet" href="` + prefix + `assets/site.css"><link rel="stylesheet" href="` + prefix + `assets/docs.css"></head><body data-mode="light" data-theme="signal"><a class="skip-link" href="#content">Skip to content</a>` + header + `<div class="docs-shell">` + productTabs(m, prefix) + `<div class="layout"><aside aria-label="Documentation navigation"><p class="product">` + esc(p.Title) + `</p>` + nav(id, p, current, depth) + `</aside><main id="content" tabindex="-1"><div id="search-results" hidden></div><label class="search-label">Search documentation<input id="search" type="search" placeholder="Search docs" autocomplete="off"></label><article class="article-content">` + content + `</article>` + provenance + `</main></div></div>` + footer + `<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js" defer></script><script src="` + prefix + `assets/site.js" defer></script><script src="` + prefix + `assets/search.js" defer></script><script src="` + prefix + `assets/article-enhance.js" defer></script></body></html>`
+}
+func build(root, docs string) error {
+	absRoot, e := filepath.Abs(root)
+	if e != nil {
+		return e
+	}
+	here := filepath.Join(absRoot, docs)
+	out := filepath.Join(here, "dist")
+	portalRoot := filepath.Clean(filepath.Join(absRoot, "..", "inferorigins", "portald"))
+	var m manifest
+	var s site
+	if e = readJSON(filepath.Join(here, "manifest.json"), &m); e != nil {
+		return e
+	}
+	if e = readJSON(filepath.Join(here, "site.json"), &s); e != nil {
+		return e
+	}
+	if e = validate(absRoot, m, s); e != nil {
+		return e
+	}
+	override := strings.TrimSuffix(strings.TrimSpace(os.Getenv("INFER_DOCS_BASE_URL")), "/")
+	if override != "" && !validOrigin(override) {
+		return errors.New("INFER_DOCS_BASE_URL must be an HTTPS origin")
+	}
+	header, footer, e := portalShell(portalRoot, s.CompanyURL, s.PublicOrigin)
+	if e != nil {
+		return e
+	}
+	if e = os.RemoveAll(out); e != nil {
+		return e
+	}
+	for _, name := range []string{"docs.css", "search.js", "article-enhance.js"} {
+		assetPath := filepath.Join(here, "assets", name)
+		if name == "article-enhance.js" {
+			assetPath = filepath.Join(portalRoot, "..", "infer-utils", "assets", name)
+		}
+		b, e := os.ReadFile(assetPath)
+		if e != nil {
+			return e
+		}
+		if e = write(filepath.Join(out, "assets", name), b); e != nil {
+			return e
+		}
+	}
+	// Reuse the portal's compiled CSS and its mobile navigation JavaScript.
+	for _, asset := range []struct{ src, dst string }{
+		{"web/static/css/site.css", "assets/site.css"},
+		{"web/static/js/site.js", "assets/site.js"},
+	} {
+		b, err := os.ReadFile(filepath.Join(portalRoot, asset.src))
+		if err != nil {
+			return err
+		}
+		if err = write(filepath.Join(out, asset.dst), b); err != nil {
+			return err
+		}
+	}
+	rows := []indexRow{}
+	rags := []ragRow{}
+	var cards strings.Builder
+	for _, id := range []string{"cdeck", "opendp"} {
+		p, ok := m.Products[id]
+		if !ok {
+			continue
+		}
+		origin := strings.TrimSuffix(s.Products[id].Origin, "/")
+		if override != "" {
+			origin = override + "/" + id
+		}
+		first := ""
+		if len(p.Navigation) > 0 && len(p.Navigation[0].Pages) > 0 {
+			first = p.Navigation[0].Pages[0].Slug
+		}
+		landing := `<h1>` + esc(p.Title) + `</h1><p class="lead">` + esc(p.Description) + `</p><p><a href="` + first + `/">Get started →</a></p>`
+		if e = write(filepath.Join(out, id, "index.html"), []byte(pageHTML(p.Title, id, m, landing, origin+"/", "", 1, "", header, footer))); e != nil {
+			return e
+		}
+		cards.WriteString(`<a class="product-card" href="` + id + `/"><strong>` + esc(p.Title) + `</strong><span>` + esc(p.Description) + `</span></a>`)
+		for _, g := range p.Navigation {
+			for _, pg := range g.Pages {
+				raw, e := os.ReadFile(filepath.Join(absRoot, pg.Source))
+				if e != nil {
+					return e
+				}
+				contentMarkdown := docPattern.ReplaceAllStringFunc(string(raw), func(v string) string {
+					ss := docPattern.FindStringSubmatch(v)
+					if ss[1] == id {
+						return "../" + ss[2] + "/"
+					}
+					return "../../" + ss[1] + "/" + ss[2] + "/"
+				})
+				var rendered bytes.Buffer
+				if e = markdown.Convert([]byte(contentMarkdown), &rendered); e != nil {
+					return e
+				}
+				title := pg.Title
+				if h := headingPattern.FindStringSubmatch(string(raw)); len(h) > 1 {
+					title = h[1]
+				}
+				canon := origin + "/" + pg.Slug + "/"
+				pageout := filepath.Join(out, id, pg.Slug, "index.html")
+				if e = write(pageout, []byte(pageHTML(title, id, m, rendered.String(), canon, pg.Slug, 2, pg.Source, header, footer))); e != nil {
+					return e
+				}
+				sum := sha256.Sum256(raw)
+				repo := strings.Split(pg.Source, "/")[0]
+				plain := strings.Join(strings.Fields(string(raw)), " ")
+				if len(plain) > 20000 {
+					plain = plain[:20000]
+				}
+				rows = append(rows, indexRow{id, g.Title, title, "/" + id + "/" + pg.Slug + "/", plain})
+				rags = append(rags, ragRow{id, g.Title, title, canon, repo, pg.Source, gitRev(absRoot, repo), "public", fmt.Sprintf("%x", sum)})
+			}
+		}
+	}
+	home := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Infer Origins Documentation</title><link rel="stylesheet" href="assets/site.css"><link rel="stylesheet" href="assets/docs.css"></head><body data-mode="light" data-theme="signal">` + header + `<div class="docs-shell">` + productTabs(m, "./") + `<main class="home"><h1>Documentation</h1><p class="lead">CDeck and OpenDP technical documentation, assembled from reviewed repository-owned sources.</p><div class="products">` + cards.String() + `</div></main></div>` + footer + `<script src="assets/site.js" defer></script></body></html>`
+	if e = write(filepath.Join(out, "index.html"), []byte(home)); e != nil {
+		return e
+	}
+	if e = jsonWrite(filepath.Join(out, "index.json"), rows); e != nil {
+		return e
+	}
+	if e = jsonWrite(filepath.Join(out, "rag-manifest.json"), rags); e != nil {
+		return e
+	}
+	fmt.Printf("Generated %d documentation pages, %d products: %s\n", len(rows), len(m.Products), out)
+	return nil
+}
