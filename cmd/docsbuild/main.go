@@ -136,6 +136,12 @@ func sourcePath(root, source string) string {
 	return filepath.Join(root, source)
 }
 
+// A reference can point to a published page or a declared legacy redirect.
+// Redirect targets are verified separately by validate.
+func validDocReference(id string, pages map[string]bool, redirects map[string]string) bool {
+	return pages[id] || redirects[id] != ""
+}
+
 func validate(root string, m manifest, s site) error {
 	if !validOrigin(s.CompanyURL) {
 		return errors.New("site.json company_url must be an HTTPS origin")
@@ -198,7 +204,7 @@ func validate(root string, m manifest, s site) error {
 					return e
 				}
 				for _, match := range docPattern.FindAllStringSubmatch(string(b), -1) {
-					if !keys[match[1]+"/"+match[2]] {
+					if !validDocReference(match[1]+"/"+match[2], keys, m.Redirects) {
 						return fmt.Errorf("broken doc link in %s: %s", id+"/"+pg.Slug, match[0])
 					}
 				}

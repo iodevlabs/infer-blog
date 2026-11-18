@@ -58,3 +58,20 @@ func TestProductOriginValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidDocReferenceAcceptsDeclaredRedirect(t *testing.T) {
+	pages := map[string]bool{"cdeck/cli-render": true}
+	redirects := map[string]string{"cdeck/rendering": "cdeck/cli-render"}
+	for _, tc := range []struct {
+		id   string
+		want bool
+	}{
+		{"cdeck/cli-render", true},
+		{"cdeck/rendering", true},
+		{"cdeck/not-published", false},
+	} {
+		if got := validDocReference(tc.id, pages, redirects); got != tc.want {
+			t.Errorf("validDocReference(%q) = %t, want %t", tc.id, got, tc.want)
+		}
+	}
+}
