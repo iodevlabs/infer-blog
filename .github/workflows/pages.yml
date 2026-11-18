@@ -29,22 +29,41 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: infer-blog
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Checkout infer-blog
+        uses: actions/checkout@v4
+        with:
+          path: infer-blog
+
+      - name: Checkout infer-utils
+        uses: actions/checkout@v4
+        with:
+          repository: iodevlabs/infer-utils
+          path: infer-utils
+          token: ${{ secrets.GH_REPO_READ_TOKEN }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: infer-blog/go.mod
           cache: true
+          cache-dependency-path: |
+            infer-blog/go.sum
+            infer-utils/go.sum
 
-      # FFmpeg is an OS-level dependency, so install it here rather
-      # than making the Makefile depend on apt/Ubuntu.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+
+      - name: Verify shared module
+        run: |
+          test -f ../infer-utils/go.mod
+          go list -m inferorigins.com/infer-utils
 
       - name: Check dependencies
         run: make check-deps
@@ -75,12 +94,8 @@ jobs:
 
       - name: Verify build output
         run: |
-          echo
           echo "Generated files:"
           find "$PUBLIC_DIR" -maxdepth 5 -type f | sort
-
-          echo
-          echo "Checking required deployment files..."
 
           test -f "$PUBLIC_DIR/index.html"
           test -f "$PUBLIC_DIR/index.json"
@@ -88,12 +103,8 @@ jobs:
           test -f "$PUBLIC_DIR/CNAME"
           test -f "$PUBLIC_DIR/.nojekyll"
 
-          echo
           echo "CNAME:"
           cat "$PUBLIC_DIR/CNAME"
-
-          echo
-          echo "Build output verified."
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -101,7 +112,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: ./public
+          path: ./infer-blog/public
 
   deploy:
     name: Deploy
