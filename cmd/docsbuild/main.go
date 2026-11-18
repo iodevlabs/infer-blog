@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"inferorigins.com/infer-utils/diagram"
 	"inferorigins.com/infer-utils/markdown"
 )
 
@@ -37,7 +38,8 @@ type product struct {
 	Navigation  []group `json:"navigation"`
 }
 type manifest struct {
-	Products map[string]product `json:"products"`
+	Products  map[string]product `json:"products"`
+	Redirects map[string]string  `json:"redirects,omitempty"`
 }
 type site struct {
 	CompanyURL   string `json:"company_url"`
@@ -170,6 +172,22 @@ func validate(root string, m manifest, s site) error {
 					return fmt.Errorf("missing %s: %w", pg.Source, e)
 				}
 			}
+		}
+	}
+	// Keep existing documentation bookmarks working when a reader journey is consolidated.
+	for from, to := range m.Redirects {
+		parts := strings.Split(from, "/")
+		target := strings.Split(to, "/")
+		if len(parts) != 2 || len(target) != 2 ||
+			!slugPattern.MatchString(parts[0]) || !slugPattern.MatchString(parts[1]) ||
+			!slugPattern.MatchString(target[0]) || !slugPattern.MatchString(target[1]) {
+			return fmt.Errorf("invalid documentation redirect: %s -> %s", from, to)
+		}
+		if keys[from] || !keys[to] || from == to {
+			return fmt.Errorf("redirect must have an unused source and a published target: %s -> %s", from, to)
+		}
+		if _, ok := m.Products[parts[0]]; !ok {
+			return fmt.Errorf("redirect source product is unknown: %s", from)
 		}
 	}
 	for id, p := range m.Products {
@@ -394,7 +412,12 @@ func build(root, docs string) error {
 				if e != nil {
 					return e
 				}
-				contentMarkdown := docPattern.ReplaceAllStringFunc(string(raw), func(v string) string {
+				for _, issue := range diagram.ValidateMarkdown(raw) {
+                    location := fmt.Sprintf("%s:%d", pg.Source, issue.Line)
+                    if issue.Level == "error" { return fmt.Errorf("Mermaid policy %s: %s", location, issue.Message) }
+                    fmt.Fprintf(os.Stderr, "docsbuild: Mermaid policy warning %s: %s\n", location, issue.Message)
+                }
+                contentMarkdown := docPattern.ReplaceAllStringFunc(string(raw), func(v string) string {
 					ss := docPattern.FindStringSubmatch(v)
 					if ss[1] == id {
 						return "../" + ss[2] + "/"
@@ -423,6 +446,25 @@ func build(root, docs string) error {
 				rows = append(rows, indexRow{id, g.Title, title, "/" + id + "/" + pg.Slug + "/", plain})
 				rags = append(rags, ragRow{id, g.Title, title, canon, repo, pg.Source, gitRev(absRoot, repo), "public", fmt.Sprintf("%x", sum)})
 			}
+		}
+	}
+	// Redirect former public URLs without adding obsolete entries to navigation,
+	// search indexes or the RAG manifest. Use local relative URLs in previews.
+	for from, to := range m.Redirects {
+		parts := strings.Split(from, "/")
+		target := strings.Split(to, "/")
+		href := strings.TrimSuffix(s.Products[target[0]].Origin, "/") + "/" + target[1] + "/"
+		if override != "" {
+			// Local preview serves both products under one host.
+			href = "../../" + target[0] + "/" + target[1] + "/"
+		}
+		doc := `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+			`<meta http-equiv="refresh" content="0;url=` + esc(href) + `">` +
+			`<meta name="robots" content="noindex">` +
+			`<title>Page moved</title></head><body><p>This documentation has moved to ` +
+			`<a href="` + esc(href) + `">the updated guide</a>.</p></body></html>`
+		if e = write(filepath.Join(out, parts[0], parts[1], "index.html"), []byte(doc)); e != nil {
+			return e
 		}
 	}
 	home := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Infer Origins Documentation</title><link rel="stylesheet" href="assets/site.css"><link rel="stylesheet" href="assets/docs.css"></head><body data-mode="light" data-theme="signal">` + header + `<div class="docs-shell">` + productTabs(m, "./") + `<main class="home"><h1>Documentation</h1><p class="lead">CDeck and OpenDP technical documentation, assembled from reviewed repository-owned sources.</p><div class="products">` + cards.String() + `</div></main></div>` + footer + `<script src="assets/site.js" defer></script></body></html>`
